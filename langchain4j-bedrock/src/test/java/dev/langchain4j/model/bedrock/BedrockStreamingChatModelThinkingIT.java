@@ -98,6 +98,75 @@ class BedrockStreamingChatModelThinkingIT {
         verifyNoMoreInteractions(spyHandler2);
     }
 
+    // Note: Claude 4.6 model IDs are placeholders — verify against AWS Bedrock model availability before running
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "us.anthropic.claude-sonnet-4-6-20250929-v1:0",
+            "us.anthropic.claude-opus-4-6-20250514-v1:0",
+    })
+    void should_return_and_send_adaptive_thinking(String modelId) {
+
+        // given
+        boolean returnThinking = true;
+        // sendThinking = true by default
+
+        BedrockChatRequestParameters parameters = BedrockChatRequestParameters.builder()
+                .thinking(BedrockThinking.adaptive())
+                .build();
+
+        StreamingChatModel model = BedrockStreamingChatModel.builder()
+                .modelId(modelId)
+
+                .returnThinking(returnThinking)
+                .defaultRequestParameters(parameters)
+
+                .logRequests(true)
+                .logResponses(true)
+                .build();
+
+        UserMessage userMessage1 = UserMessage.from("What is the capital of Germany?");
+
+        // when
+        TestStreamingChatResponseHandler spyHandler1 = spy(new TestStreamingChatResponseHandler());
+        model.chat(List.of(userMessage1), spyHandler1);
+
+        // then
+        AiMessage aiMessage1 = spyHandler1.get().aiMessage();
+        assertThat(aiMessage1.text()).containsIgnoringCase("Berlin");
+        assertThat(aiMessage1.thinking()).isNotBlank();
+        assertThat(aiMessage1.attribute("thinking_signature", String.class)).isNotBlank();
+
+        InOrder inOrder1 = inOrder(spyHandler1);
+        inOrder1.verify(spyHandler1).get();
+        inOrder1.verify(spyHandler1, atLeastOnce()).onPartialThinking(any(), any());
+        inOrder1.verify(spyHandler1, atLeastOnce()).onPartialResponse(any(), any());
+        inOrder1.verify(spyHandler1).onCompleteResponse(any());
+        inOrder1.verifyNoMoreInteractions();
+        verifyNoMoreInteractions(spyHandler1);
+
+        // given
+        UserMessage userMessage2 = UserMessage.from("What is the capital of France?");
+
+        // when
+        sleepIfNeeded(SLEEPING_TIME_MULTIPLIER);
+        TestStreamingChatResponseHandler spyHandler2 = spy(new TestStreamingChatResponseHandler());
+        model.chat(List.of(userMessage1, aiMessage1, userMessage2), spyHandler2);
+
+        // then
+        AiMessage aiMessage2 = spyHandler2.get().aiMessage();
+        assertThat(aiMessage2.text()).containsIgnoringCase("Paris");
+        assertThat(aiMessage2.thinking()).isNotBlank();
+        assertThat(aiMessage2.attribute("thinking_signature", String.class)).isNotBlank();
+
+        InOrder inOrder2 = inOrder(spyHandler2);
+        inOrder2.verify(spyHandler2).get();
+        inOrder2.verify(spyHandler2, atLeastOnce()).onPartialThinking(any(), any());
+        inOrder2.verify(spyHandler2, atLeastOnce()).onPartialResponse(any(), any());
+        inOrder2.verify(spyHandler2).onCompleteResponse(any());
+        inOrder2.verifyNoMoreInteractions();
+        verifyNoMoreInteractions(spyHandler2);
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {
             "us.anthropic.claude-sonnet-4-20250514-v1:0",

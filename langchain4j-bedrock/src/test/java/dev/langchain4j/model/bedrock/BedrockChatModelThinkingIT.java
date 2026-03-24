@@ -74,6 +74,152 @@ class BedrockChatModelThinkingIT {
         assertThat(aiMessage2.attribute("thinking_signature", String.class)).isNotBlank();
     }
 
+    // Note: Claude 4.6 model IDs are placeholders — verify against AWS Bedrock model availability before running
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "us.anthropic.claude-sonnet-4-6-20250929-v1:0",
+            "us.anthropic.claude-opus-4-6-20250514-v1:0",
+    })
+    void should_return_and_send_adaptive_thinking(String modelId) {
+
+        // given
+        boolean returnThinking = true;
+        // sendThinking = true by default
+
+        BedrockChatRequestParameters parameters = BedrockChatRequestParameters.builder()
+                .thinking(BedrockThinking.adaptive())
+                .build();
+
+        ChatModel model = BedrockChatModel.builder()
+                .modelId(modelId)
+
+                .returnThinking(returnThinking)
+                .defaultRequestParameters(parameters)
+
+                .logRequests(true)
+                .logResponses(true)
+                .build();
+
+        UserMessage userMessage1 = UserMessage.from("What is the capital of Germany?");
+
+        // when
+        ChatResponse chatResponse1 = model.chat(userMessage1);
+
+        // then
+        AiMessage aiMessage1 = chatResponse1.aiMessage();
+        assertThat(aiMessage1.text()).containsIgnoringCase("Berlin");
+        assertThat(aiMessage1.thinking()).isNotBlank();
+        assertThat(aiMessage1.attribute("thinking_signature", String.class)).isNotBlank();
+
+        // given
+        UserMessage userMessage2 = UserMessage.from("What is the capital of France?");
+
+        // when
+        sleepIfNeeded(SLEEPING_TIME_MULTIPLIER);
+        ChatResponse chatResponse2 = model.chat(userMessage1, aiMessage1, userMessage2);
+
+        // then
+        AiMessage aiMessage2 = chatResponse2.aiMessage();
+        assertThat(aiMessage2.text()).containsIgnoringCase("Paris");
+        assertThat(aiMessage2.thinking()).isNotBlank();
+        assertThat(aiMessage2.attribute("thinking_signature", String.class)).isNotBlank();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "us.anthropic.claude-sonnet-4-6-20250929-v1:0",
+            "us.anthropic.claude-opus-4-6-20250514-v1:0",
+    })
+    void should_return_and_send_adaptive_thinking_with_tools(String modelId) {
+
+        // given
+        boolean returnThinking = true;
+
+        ToolSpecification toolSpecification = ToolSpecification.builder()
+                .name("getWeather")
+                .parameters(JsonObjectSchema.builder()
+                        .addStringProperty("city")
+                        .required("city")
+                        .build())
+                .build();
+
+        BedrockChatRequestParameters parameters = BedrockChatRequestParameters.builder()
+                .toolSpecifications(List.of(toolSpecification))
+                .thinking(BedrockThinking.adaptive())
+                .build();
+
+        ChatModel model = BedrockChatModel.builder()
+                .modelId(modelId)
+
+                .returnThinking(returnThinking)
+                .defaultRequestParameters(parameters)
+
+                .logRequests(true)
+                .logResponses(true)
+                .build();
+
+        UserMessage userMessage1 = UserMessage.from("What is the weather in Munich?");
+
+        // when
+        ChatResponse chatResponse1 = model.chat(userMessage1);
+
+        // then
+        AiMessage aiMessage1 = chatResponse1.aiMessage();
+        assertThat(aiMessage1.thinking()).isNotBlank();
+        assertThat(aiMessage1.attribute("thinking_signature", String.class)).isNotBlank();
+        assertThat(aiMessage1.toolExecutionRequests()).hasSize(1);
+        ToolExecutionRequest toolExecutionRequest1 = aiMessage1.toolExecutionRequests().get(0);
+        assertThat(toolExecutionRequest1.name()).isEqualTo(toolSpecification.name());
+        assertThat(toolExecutionRequest1.arguments()).contains("Munich");
+
+        // given
+        ToolExecutionResultMessage toolResultMessage1 = ToolExecutionResultMessage.from(toolExecutionRequest1, "sunny");
+
+        // when
+        sleepIfNeeded(SLEEPING_TIME_MULTIPLIER);
+        ChatResponse chatResponse2 = model.chat(userMessage1, aiMessage1, toolResultMessage1);
+
+        // then
+        AiMessage aiMessage2 = chatResponse2.aiMessage();
+        assertThat(aiMessage2.text()).containsIgnoringCase("sun");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+    })
+    void should_return_and_send_enabled_thinking_via_thinking_config(String modelId) {
+
+        // given
+        boolean returnThinking = true;
+
+        BedrockChatRequestParameters parameters = BedrockChatRequestParameters.builder()
+                .thinking(BedrockThinking.enabled(THINKING_BUDGET_TOKENS))
+                .build();
+
+        ChatModel model = BedrockChatModel.builder()
+                .modelId(modelId)
+
+                .returnThinking(returnThinking)
+                .defaultRequestParameters(parameters)
+
+                .logRequests(true)
+                .logResponses(true)
+                .build();
+
+        UserMessage userMessage1 = UserMessage.from("What is the capital of Germany?");
+
+        // when
+        ChatResponse chatResponse1 = model.chat(userMessage1);
+
+        // then
+        AiMessage aiMessage1 = chatResponse1.aiMessage();
+        assertThat(aiMessage1.text()).containsIgnoringCase("Berlin");
+        assertThat(aiMessage1.thinking()).isNotBlank();
+        assertThat(aiMessage1.attribute("thinking_signature", String.class)).isNotBlank();
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {
             "us.anthropic.claude-sonnet-4-20250514-v1:0",
