@@ -122,6 +122,29 @@ public class BedrockChatRequestParameters extends DefaultChatRequestParameters {
         }
 
         /**
+         * Configures Claude's extended thinking via the {@code "thinking"} key in
+         * {@code additionalModelRequestFields}.
+         * <p>
+         * Use {@link BedrockThinking#adaptive()} for Claude 4.6+ or
+         * {@link BedrockThinking#enabled(int)} for Claude 3.7/4.5.
+         * <p>
+         * This is separate from {@link #enableReasoning(Integer)} which targets
+         * Amazon Nova models via the {@code "reasoning_config"} key.
+         *
+         * @param thinking the thinking configuration (null is a no-op)
+         * @see BedrockThinking
+         */
+        public Builder thinking(BedrockThinking thinking) {
+            if (thinking != null) {
+                if (additionalModelRequestFields == null) {
+                    additionalModelRequestFields = new HashMap<>();
+                }
+                additionalModelRequestFields.put("thinking", thinking.toMap());
+            }
+            return this;
+        }
+
+        /**
          * Enables prompt caching and sets where to place the cache point in the conversation.
          * Cache points mark where to cache content for reuse across API calls.
          * The cache has a 5-minute TTL which resets on each cache hit.

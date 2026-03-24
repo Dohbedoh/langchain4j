@@ -2,6 +2,7 @@ package dev.langchain4j.model.bedrock;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class BedrockChatRequestParametersTest {
@@ -280,5 +281,89 @@ class BedrockChatRequestParametersTest {
         assertThat(params.serviceTier()).isEqualTo(BedrockServiceTier.FLEX);
         assertThat(params.cachePointPlacement()).isEqualTo(BedrockCachePointPlacement.AFTER_SYSTEM);
         assertThat(params.bedrockGuardrailConfiguration().guardrailIdentifier()).isEqualTo("12345");
+    }
+
+    @Test
+    void should_set_adaptive_thinking() {
+        // Given & When
+        BedrockChatRequestParameters params = BedrockChatRequestParameters.builder()
+                .thinking(BedrockThinking.adaptive())
+                .build();
+
+        // Then
+        assertThat(params.additionalModelRequestFields())
+                .isNotNull()
+                .containsKey("thinking");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> thinking = (Map<String, Object>) params.additionalModelRequestFields().get("thinking");
+        assertThat(thinking)
+                .containsEntry("type", "adaptive")
+                .hasSize(1);
+    }
+
+    @Test
+    void should_set_enabled_thinking_with_budget() {
+        // Given & When
+        BedrockChatRequestParameters params = BedrockChatRequestParameters.builder()
+                .thinking(BedrockThinking.enabled(2048))
+                .build();
+
+        // Then
+        assertThat(params.additionalModelRequestFields())
+                .isNotNull()
+                .containsKey("thinking");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> thinking = (Map<String, Object>) params.additionalModelRequestFields().get("thinking");
+        assertThat(thinking)
+                .containsEntry("type", "enabled")
+                .containsEntry("budget_tokens", 2048)
+                .hasSize(2);
+    }
+
+    @Test
+    void thinking_null_should_be_noop() {
+        // Given & When
+        BedrockChatRequestParameters params = BedrockChatRequestParameters.builder()
+                .thinking(null)
+                .build();
+
+        // Then
+        assertThat(params.additionalModelRequestFields()).isNullOrEmpty();
+    }
+
+    @Test
+    void thinking_should_coexist_with_other_additional_fields() {
+        // Given & When
+        BedrockChatRequestParameters params = BedrockChatRequestParameters.builder()
+                .thinking(BedrockThinking.adaptive())
+                .additionalModelRequestField("anthropic_beta", "interleaved-thinking-2025-05-14")
+                .build();
+
+        // Then
+        assertThat(params.additionalModelRequestFields())
+                .containsKey("thinking")
+                .containsEntry("anthropic_beta", "interleaved-thinking-2025-05-14");
+    }
+
+    @Test
+    void override_should_replace_thinking_config() {
+        // Given
+        BedrockChatRequestParameters original = BedrockChatRequestParameters.builder()
+                .thinking(BedrockThinking.enabled(1024))
+                .build();
+
+        BedrockChatRequestParameters override = BedrockChatRequestParameters.builder()
+                .thinking(BedrockThinking.adaptive())
+                .build();
+
+        // When
+        BedrockChatRequestParameters merged = original.overrideWith(override);
+
+        // Then
+        @SuppressWarnings("unchecked")
+        Map<String, Object> thinking = (Map<String, Object>) merged.additionalModelRequestFields().get("thinking");
+        assertThat(thinking)
+                .containsEntry("type", "adaptive")
+                .doesNotContainKey("budget_tokens");
     }
 }
