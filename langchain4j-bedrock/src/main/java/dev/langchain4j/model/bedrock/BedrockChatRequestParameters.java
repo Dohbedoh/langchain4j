@@ -104,10 +104,15 @@ public class BedrockChatRequestParameters extends DefaultChatRequestParameters {
         }
 
         /**
-         * Enables <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/inference-reasoning.html">reasoning</a>.
+         * Enables <a href="https://docs.aws.amazon.com/bedrock/latest/userguide/inference-reasoning.html">reasoning</a>
+         * via the {@code "reasoning_config"} key in {@code additionalModelRequestFields}.
+         * <p>
+         * For Claude models, prefer {@link #thinking(BedrockThinking)} which uses the
+         * canonical {@code "thinking"} key and supports both enabled and adaptive modes.
          *
          * @see BedrockChatModel.Builder#returnThinking(Boolean)
          * @see BedrockChatModel.Builder#sendThinking(Boolean)
+         * @see #thinking(BedrockThinking)
          */
         public Builder enableReasoning(Integer tokenBudget) {
             if (tokenBudget != null) {

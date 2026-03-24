@@ -1064,8 +1064,9 @@ abstract class AbstractBedrockChatModel {
          * Please note that this does not enable thinking/reasoning for the LLM;
          * it only controls whether to parse the {@code REASONING_CONTENT} block from the API response
          * and return it inside the {@link AiMessage}.
-         * To enable thinking, set {@link BedrockChatRequestParameters.Builder#enableReasoning(Integer)}
+         * To enable thinking for Claude models, set {@link BedrockChatRequestParameters.Builder#thinking(BedrockThinking)}
          * via {@link #defaultRequestParameters(ChatRequestParameters)}.
+         * For Amazon Nova models, use {@link BedrockChatRequestParameters.Builder#enableReasoning(Integer)}.
          * <p>
          * Disabled by default.
          * If enabled, the thinking text will be stored within the {@link AiMessage} and may be persisted.
