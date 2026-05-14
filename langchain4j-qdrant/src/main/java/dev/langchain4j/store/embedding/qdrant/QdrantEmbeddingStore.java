@@ -7,6 +7,7 @@ import static dev.langchain4j.internal.ValidationUtils.ensureNotEmpty;
 import static dev.langchain4j.internal.ValidationUtils.ensureNotNull;
 import static io.qdrant.client.PointIdFactory.id;
 import static io.qdrant.client.ValueFactory.value;
+import static io.qdrant.client.VectorsFactory.namedVectors;
 import static io.qdrant.client.VectorsFactory.vectors;
 import static io.qdrant.client.WithPayloadSelectorFactory.enable;
 import static java.util.Collections.emptyList;
@@ -21,6 +22,7 @@ import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.store.embedding.*;
 import io.qdrant.client.QdrantClient;
 import io.qdrant.client.QdrantGrpcClient;
+import io.qdrant.client.VectorInputFactory;
 import io.qdrant.client.WithVectorsSelectorFactory;
 import io.qdrant.client.grpc.Common.Filter;
 import io.qdrant.client.grpc.JsonWithInt.Value;
@@ -28,8 +30,15 @@ import io.qdrant.client.grpc.Points;
 import io.qdrant.client.grpc.Points.DeletePoints;
 import io.qdrant.client.grpc.Points.PointStruct;
 import io.qdrant.client.grpc.Points.PointsSelector;
+import io.qdrant.client.grpc.Points.PrefetchQuery;
+import io.qdrant.client.grpc.Points.Query;
+import io.qdrant.client.grpc.Points.QueryPoints;
+import io.qdrant.client.grpc.Points.Rrf;
 import io.qdrant.client.grpc.Points.ScoredPoint;
 import io.qdrant.client.grpc.Points.SearchPoints;
+import io.qdrant.client.grpc.Points.SparseVector;
+import io.qdrant.client.grpc.Points.Vector;
+import io.qdrant.client.grpc.Points.VectorOutput;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -43,16 +52,55 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Represents a <a href="https://qdrant.tech/">Qdrant</a> collection as an
- * embedding store. With
- * support for storing {@link dev.langchain4j.data.document.Metadata}.
+ * Represents a <a href="https://qdrant.tech/">Qdrant</a> collection as an embedding store.
+ * Supports storing {@link dev.langchain4j.data.document.Metadata}.
+ *
+ * <p>Supports two search modes:
+ * <ul>
+ *   <li>{@link SearchMode#VECTOR} — standard dense vector search (default)</li>
+ *   <li>{@link SearchMode#HYBRID} — combines dense and sparse vector search using
+ *       Qdrant's server-side <a href="https://qdrant.tech/documentation/concepts/hybrid-queries/">
+ *       Reciprocal Rank Fusion (RRF)</a></li>
+ * </ul>
+ *
+ * <h2>Decoupled ingestion and search</h2>
+ * <p>Ingestion is driven by the presence of a {@link QdrantSparseEmbeddingFunction}, not
+ * by the {@code searchMode}. When a sparse embedding function is configured, both dense and
+ * sparse named vectors are stored regardless of the active search mode. This allows switching
+ * between {@code VECTOR} and {@code HYBRID} search on the same collection without re-ingesting data.
+ *
+ * <p>Conversely, data ingested without a sparse embedding function (legacy/unnamed vectors) cannot
+ * be searched in {@code HYBRID} mode without re-ingestion.
+ *
+ * <h2>Hybrid mode requirements</h2>
+ * <ul>
+ *   <li>The Qdrant collection must be configured with named dense and sparse vectors
+ *       matching {@code denseVectorName} and {@code sparseVectorName}</li>
+ *   <li>A {@link QdrantSparseEmbeddingFunction} must be provided</li>
+ *   <li>{@link dev.langchain4j.store.embedding.EmbeddingSearchRequest#query()} must be
+ *       non-blank at search time (used to generate the sparse query vector)</li>
+ * </ul>
  */
 public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
     private static final Logger log = LoggerFactory.getLogger(QdrantEmbeddingStore.class);
 
+    /**
+     * Search modes for the embedding store.
+     */
+    public enum SearchMode {
+        VECTOR,
+        HYBRID
+    }
+
     private final QdrantClient client;
     private final String payloadTextKey;
     private final String collectionName;
+    private final SearchMode searchMode;
+    private final String denseVectorName;
+    private final String sparseVectorName;
+    private final QdrantSparseEmbeddingFunction sparseEmbeddingFunction;
+    private final int rrfK;
+    private final int prefetchLimit;
 
     /**
      * @param collectionName The name of the Qdrant collection.
@@ -70,6 +118,34 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
             boolean useTls,
             String payloadTextKey,
             @Nullable String apiKey) {
+        this(collectionName, host, port, useTls, payloadTextKey, apiKey,
+                SearchMode.VECTOR, null, null, null, 60, 20);
+    }
+
+    /**
+     * @param client         A Qdrant client instance.
+     * @param collectionName The name of the Qdrant collection.
+     * @param payloadTextKey The field name of the text segment in the Qdrant
+     *                       payload.
+     */
+    public QdrantEmbeddingStore(QdrantClient client, String collectionName, String payloadTextKey) {
+        this(client, collectionName, payloadTextKey,
+                SearchMode.VECTOR, null, null, null, 60, 20);
+    }
+
+    QdrantEmbeddingStore(
+            String collectionName,
+            String host,
+            int port,
+            boolean useTls,
+            String payloadTextKey,
+            @Nullable String apiKey,
+            SearchMode searchMode,
+            @Nullable String denseVectorName,
+            @Nullable String sparseVectorName,
+            @Nullable QdrantSparseEmbeddingFunction sparseEmbeddingFunction,
+            int rrfK,
+            int prefetchLimit) {
 
         QdrantGrpcClient.Builder grpcClientBuilder = QdrantGrpcClient.newBuilder(host, port, useTls);
 
@@ -80,18 +156,33 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
         this.client = new QdrantClient(grpcClientBuilder.build());
         this.collectionName = collectionName;
         this.payloadTextKey = payloadTextKey;
+        this.searchMode = getOrDefault(searchMode, SearchMode.VECTOR);
+        this.denseVectorName = getOrDefault(denseVectorName, "dense");
+        this.sparseVectorName = getOrDefault(sparseVectorName, "sparse");
+        this.sparseEmbeddingFunction = sparseEmbeddingFunction;
+        this.rrfK = rrfK;
+        this.prefetchLimit = prefetchLimit;
     }
 
-    /**
-     * @param client         A Qdrant client instance.
-     * @param collectionName The name of the Qdrant collection.
-     * @param payloadTextKey The field name of the text segment in the Qdrant
-     *                       payload.
-     */
-    public QdrantEmbeddingStore(QdrantClient client, String collectionName, String payloadTextKey) {
+    QdrantEmbeddingStore(
+            QdrantClient client,
+            String collectionName,
+            String payloadTextKey,
+            SearchMode searchMode,
+            @Nullable String denseVectorName,
+            @Nullable String sparseVectorName,
+            @Nullable QdrantSparseEmbeddingFunction sparseEmbeddingFunction,
+            int rrfK,
+            int prefetchLimit) {
         this.client = client;
         this.collectionName = collectionName;
         this.payloadTextKey = payloadTextKey;
+        this.searchMode = getOrDefault(searchMode, SearchMode.VECTOR);
+        this.denseVectorName = getOrDefault(denseVectorName, "dense");
+        this.sparseVectorName = getOrDefault(sparseVectorName, "sparse");
+        this.sparseEmbeddingFunction = sparseEmbeddingFunction;
+        this.rrfK = rrfK;
+        this.prefetchLimit = prefetchLimit;
     }
 
     @Override
@@ -143,8 +234,13 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
                 UUID uuid = UUID.fromString(id);
                 Embedding embedding = embeddings.get(i);
 
-                PointStruct.Builder pointBuilder =
-                        PointStruct.newBuilder().setId(id(uuid)).setVectors(vectors(embedding.vector()));
+                PointStruct.Builder pointBuilder = PointStruct.newBuilder().setId(id(uuid));
+
+                if (sparseEmbeddingFunction != null) {
+                    pointBuilder.setVectors(buildNamedVectors(embedding, textSegments, i));
+                } else {
+                    pointBuilder.setVectors(vectors(embedding.vector()));
+                }
 
                 if (textSegments != null) {
                     Map<String, Object> metadata =
@@ -162,6 +258,27 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
         } catch (InterruptedException | ExecutionException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private Points.Vectors buildNamedVectors(Embedding embedding, List<TextSegment> textSegments, int index) {
+        Vector denseVector = Vector.newBuilder()
+                .setDense(Points.DenseVector.newBuilder().addAllData(embedding.vectorAsList()))
+                .build();
+
+        String text = (textSegments != null) ? textSegments.get(index).text() : null;
+        if (text == null || text.isBlank()) {
+            log.warn("No text available for sparse embedding at index {}, using dense vector only", index);
+            return namedVectors(Map.of(denseVectorName, denseVector));
+        }
+
+        QdrantSparseEmbedding sparseEmb = sparseEmbeddingFunction.embed(text);
+        Vector sparseVector = Vector.newBuilder()
+                .setSparse(SparseVector.newBuilder()
+                        .addAllValues(sparseEmb.values())
+                        .addAllIndices(sparseEmb.indices()))
+                .build();
+
+        return namedVectors(Map.of(denseVectorName, denseVector, sparseVectorName, sparseVector));
     }
 
     @Override
@@ -218,6 +335,18 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
 
     @Override
     public EmbeddingSearchResult<TextSegment> search(EmbeddingSearchRequest request) {
+        return switch (searchMode) {
+            case VECTOR -> vectorSearch(request);
+            case HYBRID -> hybridSearch(request);
+        };
+    }
+
+    private EmbeddingSearchResult<TextSegment> vectorSearch(EmbeddingSearchRequest request) {
+
+        if (sparseEmbeddingFunction != null) {
+            // Collection uses named vectors — use QueryPoints targeting the dense vector
+            return namedVectorSearch(request);
+        }
 
         SearchPoints.Builder searchBuilder = SearchPoints.newBuilder()
                 .setCollectionName(collectionName)
@@ -245,6 +374,112 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
 
         List<EmbeddingMatch<TextSegment>> matches = results.stream()
                 .map(vector -> toEmbeddingMatch(vector, request.queryEmbedding()))
+                .filter(match -> match.score() >= request.minScore())
+                .sorted(comparingDouble(EmbeddingMatch::score))
+                .collect(toList());
+
+        Collections.reverse(matches);
+
+        return new EmbeddingSearchResult<>(matches);
+    }
+
+    private EmbeddingSearchResult<TextSegment> namedVectorSearch(EmbeddingSearchRequest request) {
+        QueryPoints.Builder queryBuilder = QueryPoints.newBuilder()
+                .setCollectionName(collectionName)
+                .setQuery(Query.newBuilder()
+                        .setNearest(VectorInputFactory.vectorInput(request.queryEmbedding().vectorAsList())))
+                .setUsing(denseVectorName)
+                .setWithVectors(WithVectorsSelectorFactory.enable(true))
+                .setWithPayload(enable(true))
+                .setLimit(request.maxResults());
+
+        if (request.filter() != null) {
+            Filter filter = QdrantFilterConverter.convertExpression(request.filter());
+            queryBuilder.setFilter(filter);
+        }
+
+        List<ScoredPoint> results;
+
+        try {
+            results = client.queryAsync(queryBuilder.build()).get();
+        } catch (InterruptedException | ExecutionException e) {
+            throw new RuntimeException(e);
+        }
+
+        if (results.isEmpty()) {
+            return new EmbeddingSearchResult<>(emptyList());
+        }
+
+        List<EmbeddingMatch<TextSegment>> matches = results.stream()
+                .map(this::toNamedVectorEmbeddingMatch)
+                .filter(match -> match.score() >= request.minScore())
+                .sorted(comparingDouble(EmbeddingMatch::score))
+                .collect(toList());
+
+        Collections.reverse(matches);
+
+        return new EmbeddingSearchResult<>(matches);
+    }
+
+    private EmbeddingSearchResult<TextSegment> hybridSearch(EmbeddingSearchRequest request) {
+        String queryText = request.query();
+        if (queryText == null || queryText.isBlank()) {
+            throw new IllegalArgumentException(
+                    "For HYBRID search mode, query() must be provided in EmbeddingSearchRequest");
+        }
+
+        Filter qdrantFilter = request.filter() != null
+                ? QdrantFilterConverter.convertExpression(request.filter()) : null;
+
+        // Dense prefetch — filter applied here so irrelevant docs are excluded before fusion
+        PrefetchQuery.Builder densePrefetchBuilder = PrefetchQuery.newBuilder()
+                .setQuery(Query.newBuilder()
+                        .setNearest(VectorInputFactory.vectorInput(request.queryEmbedding().vectorAsList())))
+                .setUsing(denseVectorName)
+                .setLimit(prefetchLimit);
+        if (qdrantFilter != null) {
+            densePrefetchBuilder.setFilter(qdrantFilter);
+        }
+
+        // Sparse prefetch — same filter
+        QdrantSparseEmbedding sparseEmb = sparseEmbeddingFunction.embed(queryText);
+        PrefetchQuery.Builder sparsePrefetchBuilder = PrefetchQuery.newBuilder()
+                .setQuery(Query.newBuilder()
+                        .setNearest(VectorInputFactory.vectorInput(sparseEmb.values(), sparseEmb.indices())))
+                .setUsing(sparseVectorName)
+                .setLimit(prefetchLimit);
+        if (qdrantFilter != null) {
+            sparsePrefetchBuilder.setFilter(qdrantFilter);
+        }
+
+        // Fusion via server-side RRF
+        QueryPoints.Builder queryBuilder = QueryPoints.newBuilder()
+                .setCollectionName(collectionName)
+                .addPrefetch(densePrefetchBuilder.build())
+                .addPrefetch(sparsePrefetchBuilder.build())
+                .setQuery(Query.newBuilder().setRrf(Rrf.newBuilder().setK(rrfK)))
+                .setWithVectors(WithVectorsSelectorFactory.enable(true))
+                .setWithPayload(enable(true))
+                .setLimit(request.maxResults());
+
+        if (qdrantFilter != null) {
+            queryBuilder.setFilter(qdrantFilter);
+        }
+
+        List<ScoredPoint> results;
+
+        try {
+            results = client.queryAsync(queryBuilder.build()).get();
+        } catch (InterruptedException | ExecutionException e) {
+            throw new RuntimeException(e);
+        }
+
+        if (results.isEmpty()) {
+            return new EmbeddingSearchResult<>(emptyList());
+        }
+
+        List<EmbeddingMatch<TextSegment>> matches = results.stream()
+                .map(this::toNamedVectorEmbeddingMatch)
                 .filter(match -> match.score() >= request.minScore())
                 .sorted(comparingDouble(EmbeddingMatch::score))
                 .collect(toList());
@@ -298,6 +533,39 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
                         : TextSegment.from(textSegmentValue.getStringValue(), new Metadata(metadata)));
     }
 
+    private EmbeddingMatch<TextSegment> toNamedVectorEmbeddingMatch(ScoredPoint scoredPoint) {
+        Map<String, Value> payload = scoredPoint.getPayloadMap();
+
+        Value textSegmentValue = payload.getOrDefault(payloadTextKey, null);
+
+        Map<String, Object> metadata = payload.entrySet().stream()
+                .filter(entry -> !entry.getKey().equals(payloadTextKey))
+                .collect(toMap(Map.Entry::getKey, entry -> ObjectFactory.object(entry.getValue())));
+
+        // Extract dense embedding from named vectors
+        Embedding embedding = null;
+        Points.VectorsOutput vectorsOutput = scoredPoint.getVectors();
+        if (vectorsOutput.hasVectors()) {
+            VectorOutput denseOutput = vectorsOutput.getVectors().getVectorsMap().get(denseVectorName);
+            if (denseOutput != null) {
+                embedding = toEmbedding(denseOutput);
+            }
+        } else if (vectorsOutput.hasVector()) {
+            embedding = toEmbedding(vectorsOutput.getVector());
+        }
+
+        // Use Qdrant's server-computed score directly
+        double score = scoredPoint.getScore();
+
+        return new EmbeddingMatch<>(
+                score,
+                scoredPoint.getId().getUuid(),
+                embedding,
+                textSegmentValue == null
+                        ? null
+                        : TextSegment.from(textSegmentValue.getStringValue(), new Metadata(metadata)));
+    }
+
     private static Embedding toEmbedding(Points.VectorOutput vectorOutput) {
         return Embedding.from(getOrDefault(vectorOutput.getDense().getDataList(), vectorOutput.getDataList()));
     }
@@ -315,6 +583,12 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
         private String payloadTextKey = "text_segment";
         private String apiKey = null;
         private QdrantClient client = null;
+        private SearchMode searchMode = SearchMode.VECTOR;
+        private String denseVectorName = "dense";
+        private String sparseVectorName = "sparse";
+        private QdrantSparseEmbeddingFunction sparseEmbeddingFunction = null;
+        private int rrfK = 60;
+        private int prefetchLimit = 20;
 
         /**
          * @param host The host of the Qdrant instance. Defaults to "localhost".
@@ -334,7 +608,6 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
 
         /**
          * @param port The GRPC port of the Qdrant instance. Defaults to 6334.
-         * @return
          */
         public Builder port(int port) {
             this.port = port;
@@ -343,7 +616,6 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
 
         /**
          * @param useTls Whether to use TLS(HTTPS). Defaults to false.
-         * @return
          */
         public Builder useTls(boolean useTls) {
             this.useTls = useTls;
@@ -352,9 +624,7 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
 
         /**
          * @param payloadTextKey The field name of the text segment in the payload.
-         *                       Defaults to
-         *                       "text_segment".
-         * @return
+         *                       Defaults to "text_segment".
          */
         public Builder payloadTextKey(String payloadTextKey) {
             this.payloadTextKey = payloadTextKey;
@@ -377,13 +647,81 @@ public class QdrantEmbeddingStore implements EmbeddingStore<TextSegment> {
             return this;
         }
 
+        /**
+         * @param searchMode The search mode. Defaults to {@link SearchMode#VECTOR}.
+         *                   When set to {@link SearchMode#HYBRID}, the store combines dense and sparse
+         *                   vector search using Qdrant's server-side Reciprocal Rank Fusion.
+         *                   Requires {@link #sparseEmbeddingFunction} to be set.
+         */
+        public Builder searchMode(SearchMode searchMode) {
+            this.searchMode = searchMode;
+            return this;
+        }
+
+        /**
+         * @param denseVectorName The name of the dense vector in the Qdrant collection.
+         *                        Defaults to "dense". Used when {@link #sparseEmbeddingFunction} is set.
+         */
+        public Builder denseVectorName(String denseVectorName) {
+            this.denseVectorName = denseVectorName;
+            return this;
+        }
+
+        /**
+         * @param sparseVectorName The name of the sparse vector in the Qdrant collection.
+         *                         Defaults to "sparse". Used when {@link #sparseEmbeddingFunction} is set.
+         */
+        public Builder sparseVectorName(String sparseVectorName) {
+            this.sparseVectorName = sparseVectorName;
+            return this;
+        }
+
+        /**
+         * @param sparseEmbeddingFunction A function that converts text to sparse embeddings.
+         *                                Required when {@link SearchMode#HYBRID} is used.
+         *                                When provided, the store always indexes both dense and sparse
+         *                                vectors regardless of the search mode, allowing you to switch
+         *                                between VECTOR and HYBRID search without re-ingesting data.
+         */
+        public Builder sparseEmbeddingFunction(QdrantSparseEmbeddingFunction sparseEmbeddingFunction) {
+            this.sparseEmbeddingFunction = sparseEmbeddingFunction;
+            return this;
+        }
+
+        /**
+         * @param rrfK The k parameter for Reciprocal Rank Fusion. Defaults to 60.
+         *             Higher values give more weight to highly-ranked results.
+         */
+        public Builder rrfK(int rrfK) {
+            this.rrfK = rrfK;
+            return this;
+        }
+
+        /**
+         * @param prefetchLimit The maximum number of results returned by each prefetch query
+         *                      before fusion. Defaults to 20.
+         */
+        public Builder prefetchLimit(int prefetchLimit) {
+            this.prefetchLimit = prefetchLimit;
+            return this;
+        }
+
         public QdrantEmbeddingStore build() {
             Objects.requireNonNull(collectionName, "collectionName cannot be null");
 
-            if (client != null) {
-                return new QdrantEmbeddingStore(client, collectionName, payloadTextKey);
+            if (searchMode == SearchMode.HYBRID) {
+                Objects.requireNonNull(sparseEmbeddingFunction,
+                        "sparseEmbeddingFunction is required for HYBRID search mode");
             }
-            return new QdrantEmbeddingStore(collectionName, host, port, useTls, payloadTextKey, apiKey);
+
+            if (client != null) {
+                return new QdrantEmbeddingStore(client, collectionName, payloadTextKey,
+                        searchMode, denseVectorName, sparseVectorName, sparseEmbeddingFunction,
+                        rrfK, prefetchLimit);
+            }
+            return new QdrantEmbeddingStore(collectionName, host, port, useTls, payloadTextKey, apiKey,
+                    searchMode, denseVectorName, sparseVectorName, sparseEmbeddingFunction,
+                    rrfK, prefetchLimit);
         }
     }
 }
